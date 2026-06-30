@@ -516,5 +516,229 @@ If there are no explicit, concrete tasks, return an empty array.`;
 
     throw new Error('Unknown error during Gemini action extraction.');
   }
+
+  /**
+   * Cleans HTML tags from text and normalizes whitespace.
+   */
+  private static cleanHtml(text: string): string {
+    return text
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /**
+   * Generates a text embedding for an email (subject + body) and saves it to the database.
+   * If running under PostgreSQL, uses raw SQL to cast to pgvector.
+   * If running under SQLite, stores the embedding as a JSON stringified array.
+   */
+  public static async embedEmail(emailId: string): Promise<number[]> {
+    const email = await prisma.email.findUnique({
+      where: { id: emailId },
+    });
+
+    if (!email) {
+      throw new Error(`Email with ID ${emailId} not found in database.`);
+    }
+
+    const subject = email.subject || '';
+    const body = email.body || '';
+    const textToEmbed = this.cleanHtml(`${subject}\n\n${body}`);
+
+    const provider = process.env.AI_PROVIDER || 'openai';
+    let embedding: number[] = [];
+
+    if (provider === 'gemini') {
+      embedding = await this.generateEmbeddingWithGemini(textToEmbed);
+    } else {
+      embedding = await this.generateEmbeddingWithOpenAI(textToEmbed);
+    }
+
+    const isPostgres = process.env.DATABASE_URL?.startsWith('postgresql') || process.env.DATABASE_URL?.startsWith('postgres');
+
+    if (isPostgres) {
+      const embeddingString = `[${embedding.join(',')}]`;
+      await prisma.$executeRawUnsafe(
+        `UPDATE "Email" SET embedding = $1::vector WHERE id = $2`,
+        embeddingString,
+        emailId
+      );
+    } else {
+      await prisma.email.update({
+        where: { id: emailId },
+        data: {
+          embedding: JSON.stringify(embedding),
+        },
+      });
+    }
+
+    return embedding;
+  }
+
+  private static async generateEmbeddingWithOpenAI(text: string): Promise<number[]> {
+    const openai = this.getOpenAI();
+    const maxAttempts = 5;
+    let attempt = 0;
+    let delay = 1000;
+
+    while (attempt < maxAttempts) {
+      try {
+        const response = await openai.embeddings.create({
+          model: 'text-embedding-3-small',
+          input: text,
+        });
+
+        const embedding = response.data[0]?.embedding;
+        if (!embedding || embedding.length === 0) {
+          throw new Error('OpenAI returned an empty embedding.');
+        }
+
+        return embedding;
+      } catch (error: any) {
+        attempt++;
+        const isRateLimit = error.status === 429 || (error.message && error.message.includes('429'));
+
+        if (isRateLimit && attempt < maxAttempts) {
+          console.warn(
+            `[AIService] OpenAI embedding rate limit hit (429). Retrying in ${delay}ms... (Attempt ${attempt}/${maxAttempts})`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 2;
+        } else {
+          console.error(`[AIService] OpenAI embedding failed on attempt ${attempt}:`, error);
+          if (attempt >= maxAttempts) {
+            throw new Error(`Failed to generate OpenAI embedding after ${maxAttempts} attempts: ${error.message || error}`);
+          }
+          throw error;
+        }
+      }
+    }
+
+    throw new Error('Unknown error during OpenAI embedding generation.');
+  }
+
+  private static async generateEmbeddingWithGemini(text: string): Promise<number[]> {
+    const ai = this.getGemini();
+    const maxAttempts = 5;
+    let attempt = 0;
+    let delay = 1000;
+
+    while (attempt < maxAttempts) {
+      try {
+        const response = await ai.models.embedContent({
+          model: 'gemini-embedding-001',
+          contents: text,
+        });
+
+        const embedding = response.embeddings?.[0]?.values;
+        if (!embedding || embedding.length === 0) {
+          throw new Error('Gemini returned an empty embedding.');
+        }
+
+        return embedding;
+      } catch (error: any) {
+        attempt++;
+        const isRateLimit =
+          error.status === 429 ||
+          (error.message && (error.message.includes('429') || error.message.includes('ResourceExhausted') || error.message.includes('Quota exceeded') || error.message.includes('quota')));
+
+        if (isRateLimit && attempt < maxAttempts) {
+          console.warn(
+            `[AIService] Gemini embedding rate limit hit (429/ResourceExhausted). Retrying in ${delay}ms... (Attempt ${attempt}/${maxAttempts})`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay *= 2;
+        } else {
+          console.error(`[AIService] Gemini embedding failed on attempt ${attempt}:`, error);
+          if (attempt >= maxAttempts) {
+            throw new Error(`Failed to generate Gemini embedding after ${maxAttempts} attempts: ${error.message || error}`);
+          }
+          throw error;
+        }
+      }
+    }
+
+    throw new Error('Unknown error during Gemini embedding generation.');
+  }
+
+  /**
+   * Search for past emails similar to the search query.
+   * If running under PostgreSQL, uses raw SQL native pgvector cosine similarity.
+   * If running under SQLite, retrieves all embedded emails and calculates similarity in-memory.
+   */
+  public static async searchSimilarEmails(query: string, limit: number = 5): Promise<any[]> {
+    const provider = process.env.AI_PROVIDER || 'openai';
+    let queryEmbedding: number[] = [];
+
+    if (provider === 'gemini') {
+      queryEmbedding = await this.generateEmbeddingWithGemini(query);
+    } else {
+      queryEmbedding = await this.generateEmbeddingWithOpenAI(query);
+    }
+
+    const isPostgres = process.env.DATABASE_URL?.startsWith('postgresql') || process.env.DATABASE_URL?.startsWith('postgres');
+
+    if (isPostgres) {
+      const embeddingString = `[${queryEmbedding.join(',')}]`;
+      const results = await prisma.$queryRawUnsafe<any[]>(
+        `SELECT id, "messageId", sender, recipient, subject, body, status, category, "createdAt", "userId", "threadId",
+                (1 - (embedding <=> $1::vector)) as similarity
+         FROM "Email"
+         WHERE embedding IS NOT NULL
+         ORDER BY embedding <=> $1::vector ASC
+         LIMIT $2`,
+        embeddingString,
+        limit
+      );
+      return results;
+    } else {
+      const emails = await prisma.email.findMany({
+        where: {
+          embedding: {
+            not: null,
+          },
+        },
+      });
+
+      const results = emails
+        .map((email) => {
+          let dbEmbedding: number[] = [];
+          try {
+            dbEmbedding = JSON.parse(email.embedding!) as number[];
+          } catch (e) {
+            console.error(`Failed to parse embedding for email ${email.id}:`, e);
+          }
+
+          const similarity = this.cosineSimilarity(queryEmbedding, dbEmbedding);
+          return {
+            ...email,
+            similarity,
+          };
+        })
+        .sort((a, b) => b.similarity - a.similarity)
+        .slice(0, limit);
+
+      return results;
+    }
+  }
+
+  private static cosineSimilarity(a: number[], b: number[]): number {
+    if (a.length === 0 || b.length === 0 || a.length !== b.length) {
+      return 0;
+    }
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < a.length; i++) {
+      dotProduct += a[i] * b[i];
+      normA += a[i] * a[i];
+      normB += b[i] * b[i];
+    }
+    if (normA === 0 || normB === 0) {
+      return 0;
+    }
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
 }
+
 
